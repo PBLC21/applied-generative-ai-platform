@@ -36,7 +36,7 @@ try:
 except Exception:
     HAS_LLMCLIENT = False
 
-APP_TITLE = "STAAR AI — Lesson & Worksheet Generator (V0.7.3)"
+APP_TITLE = "TEKS AI — Lesson & Worksheet Generator (V0.7.3)"
 OUTPUT_DIR = Path("./outputs"); OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 load_dotenv(override=True)
 OPENAI_KEY = os.getenv("OPENAI_API_KEY", "")
