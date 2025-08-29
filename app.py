@@ -168,7 +168,7 @@ def build_attachments_summary(uploaded_files: list):
     return ("ATTACHMENTS SUMMARY\n" + "\n".join(lines)), previews
 
 # ---------------- UI ----------------
-st.set_page_config(page_title="STAAR AI Generator", layout="wide")
+st.set_page_config(page_title="TEKS AI Generator", layout="wide")
 st.markdown("""<style>textarea[aria-label="Teacher Notes"] { width: 100% !important; }</style>""", unsafe_allow_html=True)
 
 with st.sidebar:
