@@ -1,7 +1,7 @@
-﻿streamlit
-reportlab
-python-dotenv
-openai
-streamlit-pdf-viewer
-pandas
-PyPDF2
+streamlit>=1.33
+reportlab>=4.0
+python-dotenv>=1.0
+openai>=1.0
+streamlit-pdf-viewer>=0.0.13
+pandas>=2.0
+PyPDF2>=3.0
