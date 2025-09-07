@@ -1,429 +1,493 @@
-# app.py — STAAR AI (V0.7.3)
-# - Generates a separate Answer Key PDF for worksheets.
-# - Hides alignment report (still enforced internally).
-# - Supports TEKS CSV with description_en / description_es.
+# app.py — TEKS AI — Lesson & Worksheet Generator
+# - Title lower, centered
+# - Announcements a bit wider
+# - Teacher Notes file upload (PDF/DOCX/TXT/IMG)
+# - Strong text extraction from uploads (PyMuPDF + OCR fallback)
+# - Inline PREVIEW via PyMuPDF image render (page slider / show-all)
+# - Robust Generate handler with clear validation & errors
 
-import os, io, re, zipfile
-from datetime import datetime
-from pathlib import Path
-
+from __future__ import annotations
+import os, io, csv, base64, requests
+from typing import List, Dict, Optional, Tuple
+from dataclasses import is_dataclass, asdict
 import streamlit as st
-from dotenv import load_dotenv
-import pandas as pd
 
+# Optional: load .env for OPENAI_* locally
 try:
-    from streamlit_pdf_viewer import pdf_viewer  # type: ignore
-    HAS_PDF_VIEWER = True
+    from dotenv import load_dotenv
+    load_dotenv()
 except Exception:
-    HAS_PDF_VIEWER = False
-
-try:
-    from PyPDF2 import PdfReader  # type: ignore
-    HAS_PYPDF2 = True
-except Exception:
-    HAS_PYPDF2 = False
-
-from reportlab.lib.pagesizes import letter
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib.units import inch
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
-
-import generator as gen
-
-try:
-    from content_llm import LLMClient  # type: ignore
-    HAS_LLMCLIENT = True
-except Exception:
-    HAS_LLMCLIENT = False
-
-APP_TITLE = "TEKS AI — Lesson & Worksheet Generator (V0.7.3)"
-OUTPUT_DIR = Path("./outputs"); OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-load_dotenv(override=True)
-OPENAI_KEY = os.getenv("OPENAI_API_KEY", "")
-
-GRADE_OPTIONS = ["1st", "2nd", "3rd", "4th", "5th"]
-QUESTION_TYPE_OPTIONS = ["Short Answer", "Multiple Choice", "Open Response"]
-
-ATTACH_IMAGE_TYPES = ["png", "jpg", "jpeg", "webp"]
-ATTACH_DOC_TYPES = ["pdf", "txt", "md", "csv"]
-ATTACH_ALL_TYPES = ATTACH_IMAGE_TYPES + ATTACH_DOC_TYPES
-
-DEFAULT_TEKS_DESCRIPTIONS_EN = {
-    "3.6A": "Classify and sort two- and three-dimensional figures, including cones, cylinders, spheres, triangular and rectangular prisms, and cubes, based on attributes using formal geometric language.",
-    "3.6C": "Determine the area of rectangles with whole number side lengths using multiplication related to rows and columns."
-}
-DEFAULT_TEKS_DESCRIPTIONS_ES = {
-    "3.6A": "Clasificar y ordenar figuras bidimensionales y tridimensionales, incluidas los conos, cilindros, esferas, prismas triangulares y prismas rectangulares, y cubos, según atributos usando lenguaje geométrico formal.",
-    "3.6C": "Determinar el área de rectángulos con longitudes de lado en números enteros usando multiplicación relacionada con filas y columnas."
-}
-
-def _safe_rerun():
-    try: st.rerun()
-    except Exception: st.experimental_rerun()
-
-def _ts(): return datetime.now().strftime("%Y%m%d_%H%M%S")
-
-def _grade_number_from_label(label: str) -> str:
-    return re.sub(r"(st|nd|rd|th)$", "", label.strip())
-
-def filter_teks_by_grade(df: pd.DataFrame, grade_label: str) -> pd.DataFrame:
-    if df is None or df.empty or "code" not in df.columns:
-        return pd.DataFrame(columns=["code","description_en","description_es"])
-    target = _grade_number_from_label(grade_label)
-    return df[df["code"].astype(str).str.startswith(f"{target}.", na=False)].copy()
-
-def render_teks_template_download():
-    tmpl = io.StringIO()
-    tmpl.write("subject,grade,code,description_en,description_es,strand,type\n")
-    tmpl.write('math,3,3.6A,"Classify and sort two- and three-dimensional figures …","Clasificar y ordenar figuras bidimensionales y tridimensionales …",Geometry,readiness\n')
-    tmpl.write('math,3,3.6C,"Determine the area of rectangles with whole number side lengths…","Determinar el área de rectángulos con longitudes de lado en números enteros…",Geometry,readiness\n')
-    st.download_button("Download TEKS CSV template", data=tmpl.getvalue().encode("utf-8"),
-                       file_name="teks_template.csv", mime="text/csv")
-
-def write_pdf_from_markdown(md_text: str, out_path: Path, title_override: str|None=None):
-    styles = getSampleStyleSheet()
-    styles.add(ParagraphStyle(name="H1", parent=styles["Heading1"], spaceAfter=12))
-    styles.add(ParagraphStyle(name="H2", parent=styles["Heading2"], spaceAfter=8))
-    styles.add(ParagraphStyle(name="Body", parent=styles["BodyText"], leading=14))
-    doc = SimpleDocTemplate(str(out_path), pagesize=letter,
-                            leftMargin=0.75*inch, rightMargin=0.75*inch,
-                            topMargin=0.75*inch, bottomMargin=0.75*inch)
-    story = []
-    text = md_text
-    for raw_line in text.splitlines():
-        line = raw_line.rstrip()
-        if line.startswith("# ") and title_override:
-            story.append(Paragraph(f"<b>{title_override}</b>", styles["H1"]))
-        elif line.startswith("# "):
-            story.append(Paragraph(f"<b>{line[2:].strip()}</b>", styles["H1"]))
-        elif line.startswith("## "):
-            story.append(Paragraph(f"<b>{line[3:].strip()}</b>", styles["H2"]))
-        elif line.startswith("**") and line.endswith("**") and len(line)>4:
-            story.append(Paragraph(f"<b>{line.strip('**')}</b>", styles["Body"]))
-        elif line.startswith(("- ","• ")):
-            story.append(Paragraph(line[2:], styles["Body"]))
-        else:
-            story.append(Paragraph(line, styles["Body"]))
-        story.append(Spacer(1, 6))
-    doc.build(story)
-
-def render_download_and_preview(label: str, pdf_path: Path, preview_label: str, expanded: bool=False):
-    st.success(f"{label} ready → {pdf_path.name}")
-    try:
-        if HAS_PDF_VIEWER:
-            with st.expander(preview_label, expanded=expanded):
-                pdf_viewer(str(pdf_path))
-    except Exception:
-        pass
-    with open(pdf_path, "rb") as f:
-        st.download_button(f"Download {label} PDF", f, file_name=pdf_path.name, mime="application/pdf",
-                           key=f"dl_{label.replace(' ','_').lower()}_{pdf_path.name}")
-
-def zip_bundle(files: list[Path], out_zip: Path):
-    with zipfile.ZipFile(out_zip, "w", zipfile.ZIP_DEFLATED) as zf:
-        for p in files:
-            if p and p.exists(): zf.write(p, arcname=p.name)
-
-# ---- attachments extraction (unchanged) ----
-def _extract_text_from_csv(bytes_data: bytes, max_chars: int = 1200) -> str:
-    try:
-        import pandas as pd
-        from io import BytesIO
-        df = pd.read_csv(BytesIO(bytes_data))
-        return df.head(10).to_csv(index=False)[:max_chars]
-    except Exception:
-        try: return bytes_data.decode("utf-8", errors="ignore")[:max_chars]
-        except Exception: return ""
-
-def _extract_text_from_pdf(bytes_data: bytes, max_pages: int=3, max_chars: int=2000) -> str:
-    if not HAS_PYPDF2: return "(PDF attached; text extraction unavailable. Install PyPDF2.)"
-    try:
-        from io import BytesIO
-        reader = PdfReader(BytesIO(bytes_data))
-        out = []
-        for page in reader.pages[:max_pages]:
-            try: out.append(page.extract_text() or "")
-            except Exception: continue
-        txt = "\n".join(out).strip()
-        return txt[:max_chars] if txt else "(PDF attached; no extractable text.)"
-    except Exception:
-        return "(PDF attached; failed to extract text.)"
-
-def build_attachments_summary(uploaded_files: list):
-    lines, previews = [], []
-    if not uploaded_files: return "", previews
-    for uf in uploaded_files:
-        name = uf.name; ext = name.split(".")[-1].lower() if "." in name else ""
-        data = uf.getvalue()
-        if ext in ("txt","md"):
-            text = data.decode("utf-8", errors="ignore"); lines.append(f"- TEXT {name}: {text.strip()[:1200]}"); previews.append(f"{name} (text)")
-        elif ext == "csv":
-            excerpt = _extract_text_from_csv(data); lines.append(f"- CSV {name} (excerpt):\n{excerpt}"); previews.append(f"{name} (csv)")
-        elif ext == "pdf":
-            excerpt = _extract_text_from_pdf(data); lines.append(f"- PDF {name} (excerpt):\n{excerpt}"); previews.append(f"{name} (pdf)")
-        elif ext in ATTACH_IMAGE_TYPES:
-            lines.append(f"- IMAGE {name}: (no OCR)"); previews.append(f"{name} (image)")
-        else:
-            lines.append(f"- FILE {name}: ({len(data)} bytes)"); previews.append(f"{name} (file)")
-    return ("ATTACHMENTS SUMMARY\n" + "\n".join(lines)), previews
-
-# ---------------- UI ----------------
-st.set_page_config(page_title="TEKS AI Generator", layout="wide")
-st.markdown("""<style>textarea[aria-label="Teacher Notes"] { width: 100% !important; }</style>""", unsafe_allow_html=True)
-
-with st.sidebar:
-    st.subheader("Configuration")
-    st.markdown("**Upload TEKS CSV** (supports `code`, `description_en`, `description_es`, or `description`)")
-    teks_file = st.file_uploader("Upload TEKS CSV", type=["csv"])
-    if teks_file:
-        try:
-            raw_df = pd.read_csv(teks_file)
-            raw_df.columns = [c.strip().lower() for c in raw_df.columns]
-            code_col = next((c for c in ["code","teks","teks_code","standard","standard_code","id"] if c in raw_df.columns), None) or raw_df.columns[0]
-            desc_en_col = next((c for c in ["description_en","desc_en","english","english_description","en_description","description (en)","descriptionen"] if c in raw_df.columns), None)
-            desc_es_col = next((c for c in ["description_es","desc_es","spanish","spanish_description","es_description","descripcion","descripcion_es","descripción","descripción_es","description (es)","descripciones"] if c in raw_df.columns), None)
-            generic_desc_col = next((c for c in ["description","desc","teks_description","standard_description","student_expectation","se","text","statement","learning_objective"] if c in raw_df.columns), None)
-
-            df = raw_df.rename(columns={code_col:"code"})
-            if desc_en_col: df = df.rename(columns={desc_en_col:"description_en"})
-            else: df["description_en"] = ""
-            if desc_es_col: df = df.rename(columns={desc_es_col:"description_es"})
-            else: df["description_es"] = ""
-            if not desc_en_col and generic_desc_col:
-                df = df.rename(columns={generic_desc_col:"description"})
-                df["description_en"] = df["description"].astype(str)
-            elif "description" in df.columns and df["description_en"].eq("").all():
-                df["description_en"] = df["description"].astype(str)
-
-            teks_df = df[["code","description_en","description_es"]].copy()
-            st.session_state["teks_df"] = teks_df
-            st.success(f"Loaded {len(teks_df)} TEKS rows (code='{code_col}', EN='{desc_en_col or '—'}', ES='{desc_es_col or '—'}'{', generic='+generic_desc_col if generic_desc_col else ''}).")
-        except Exception as e:
-            st.error(f"Failed to read CSV: {e}")
-    teks_df = st.session_state.get("teks_df")
-
-    bilingual = st.toggle("Bilingual (EN/ES)", value=True)
-    strict_align = st.toggle("Strict TEKS Alignment (verify + revise)", value=True)
-    st.subheader("Question Types")
-    question_types = st.multiselect("Preferred types (AI aims for these)", options=QUESTION_TYPE_OPTIONS, default=["Short Answer"])
-
-    st.markdown("---")
-    with st.expander("Diagnostics", expanded=False):
-        if OPENAI_KEY: st.success("OPENAI_API_KEY found ✅")
-        else: st.warning("OPENAI_API_KEY not found.")
-        if HAS_LLMCLIENT and OPENAI_KEY:
-            if st.button("Quick LLM ping"):
-                try:
-                    LLMClient().complete("READY", max_tokens=2, temperature=0.0)
-                    st.success("LLM responded. ✅")
-                except Exception as e:
-                    st.error(f"Ping failed: {e}")
-        else:
-            st.caption("LLM ping disabled (content_llm.py or key missing).")
-
-st.title(APP_TITLE)
-
-colA, colB, colC = st.columns([1,2,2])
-with colA:
-    grade_label = st.selectbox("Grade", GRADE_OPTIONS, index=2, key="grade_widget")
-with colB:
-    show_all_teks = st.toggle("Show all TEKS (ignore grade filter)", value=False, key="show_all_teks_widget")
-with colC:
     pass
 
-choices = []
-def _grade_number_from_label(label: str) -> str:
-    return re.sub(r"(st|nd|rd|th)$", "", label.strip())
+st.set_page_config(page_title="TEKS AI — Lesson & Worksheet Generator", layout="wide")
 
-def filter_teks_by_grade(df: pd.DataFrame, grade_label: str) -> pd.DataFrame:
-    if df is None or df.empty or "code" not in df.columns:
-        return pd.DataFrame(columns=["code","description_en","description_es"])
-    target = _grade_number_from_label(grade_label)
-    return df[df["code"].astype(str).str.startswith(f"{target}.", na=False)].copy()
+TITLE_AND_STYLES = """
+<style>
+:root{
+  --muted:#64748b;--border:#e2e8f0;--soft:#f8fafc;--accent:#f43f5e;--accent2:#f97316;
+}
+.block-container{padding-top:2.2rem;} /* LOWER the title */
+.app-header{display:flex;justify-content:center;align-items:center;text-align:center;margin:.2rem 0 1rem;}
+.app-header h1{
+  font-size:2.0rem;line-height:1.25;margin:0;max-width:1100px;
+  word-break:break-word;overflow-wrap:anywhere;white-space:normal;
+}
+/* Announcement cards */
+.ann-card{border-radius:16px;padding:12px 14px;background:linear-gradient(135deg,#fff7ed,#ffffff);
+  border:1px solid #fde68a;box-shadow:0 2px 10px rgba(0,0,0,.05);}
+.ann-card + .ann-card{margin-top:12px;}
+.ann-title{font-weight:700;font-size:1rem;margin-bottom:4px;}
+.ann-sub{color:#475569;font-size:.9rem;line-height:1.35;}
+.badge{display:inline-block;margin-left:8px;padding:2px 8px;border-radius:999px;font-size:.72rem;color:#fff;
+  background:linear-gradient(to right,var(--accent),var(--accent2));}
+.small-note{color:#777;font-size:.8rem;}
+hr.soft{border:none;border-top:1px solid rgba(148,163,184,.25);margin:.4rem 0 .6rem 0;}
+/* TEKS summary card */
+.teks-summary{background:var(--soft);border:1px solid var(--border);border-radius:12px;padding:10px 12px;margin-top:.25rem;}
+.teks-summary .label{color:#0f172a;font-weight:700;}
+.teks-summary .meta{color:#334155;}
+</style>
+<div class="app-header"><h1>TEKS AI — Lesson &amp; Worksheet Generator</h1></div>
+"""
+st.markdown(TITLE_AND_STYLES, unsafe_allow_html=True)
 
-if teks_df is not None and not teks_df.empty:
-    df_g = teks_df.copy() if show_all_teks else filter_teks_by_grade(teks_df, grade_label)
-    if not df_g.empty:
-        def fmt_row(row):
-            code = str(row.get("code","")).strip()
-            en = str(row.get("description_en","") or "").strip()
-            return f"{code} — {en}" if en else code
-        choices = [fmt_row(r) for _, r in df_g.iterrows()]
+# -----------------------------------------------------------------------------
+# Config
+# -----------------------------------------------------------------------------
+DEFAULT_TEKS_URL = ("https://docs.google.com/spreadsheets/d/"
+    "1S_bzLiL5wQiwKuY5fzaIX8v0uuYT3iupdjYHMVjXEWk/export?format=csv&gid=1513594026")
+GRADE_OPTIONS = ["Kinder","1","2","3","4","5","6"]
+SUBJECT_OPTIONS = ["Math","Reading"]
 
-col1, col2 = st.columns([3,2])
-with col1:
-    teks_select = st.selectbox("TEKS (filtered by grade)",
-                               options=["(type manually)"] + choices if choices else ["(type manually)"],
-                               index=0, key="teks_select_widget")
-with col2:
-    teks_manual = st.text_input("TEKS (manual override)", key="teks_manual_widget")
+# -----------------------------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------------------------
+def _normalize_grade_in(g:str)->str:
+    g=(g or "").strip()
+    if g.lower() in {"k","kinder","kindergarten"}: return "K"
+    m={"1":"1","1st":"1","grade 1":"1","2":"2","2nd":"2","grade 2":"2","3":"3","3rd":"3","grade 3":"3",
+       "4":"4","4th":"4","grade 4":"4","5":"5","5th":"5","grade 5":"5","6":"6","6th":"6","grade 6":"6"}
+    return m.get(g.lower(), g)
 
-def _lookup_descs(df: pd.DataFrame|None, code: str) -> tuple[str,str]:
-    if df is None or not code: return "",""
+def _normalize_subject_in(s:str)->str:
+    s=(s or "").strip().title()
+    if s.startswith("Math"): return "Math"
+    if s.startswith("Read"): return "Reading"
+    return s
+
+def _smart_decode(b:bytes)->str:
     try:
-        sub = df[df["code"].astype(str).str.strip() == code]
-        if not sub.empty:
-            en = str(sub.iloc[0].get("description_en","") or "")
-            es = str(sub.iloc[0].get("description_es","") or "")
-            return en, es
-    except Exception: pass
-    return "",""
+        s=b.decode("utf-8-sig")
+        if any(x in s for x in ("Ã¡","Ã©","Ã­","Ã³","Ãº","Ã±","ÃÁ","Ã‰","Ã“","Ãš","Ã‘")):
+            try: return s.encode("latin1").decode("utf-8")
+            except Exception: return s
+        return s
+    except Exception:
+        try: return b.decode("latin1")
+        except Exception: return b.decode("utf-8", errors="ignore")
 
-teks_code = teks_manual.strip() if teks_manual.strip() else (teks_select.split(" — ",1)[0].strip() if teks_select and teks_select!="(type manually)" else "")
-desc_en, desc_es = _lookup_descs(teks_df, teks_code)
-if not desc_en: desc_en = DEFAULT_TEKS_DESCRIPTIONS_EN.get(teks_code, "")
-if not desc_es: desc_es = DEFAULT_TEKS_DESCRIPTIONS_ES.get(teks_code, "")
+def _read_csv_bytes(content:bytes)->List[Dict[str,str]]:
+    import io, csv as _csv
+    decoded=_smart_decode(content)
+    reader=_csv.DictReader(io.StringIO(decoded))
+    rows=[]
+    for r in reader:
+        row={(k or "").strip().lower():(v or "").strip() for k,v in r.items()}
+        grade=_normalize_grade_in(row.get("grade",""))
+        subject=_normalize_subject_in(row.get("subject",""))
+        code=row.get("code","")
+        if grade and subject and code:
+            rows.append({
+                "grade":grade,"subject":subject,"code":code,
+                "strand":row.get("strand",""),
+                "description_en":row.get("description_en","") or row.get("description",""),
+                "description_es":row.get("description_es",""),
+                "type":row.get("type",""),
+            })
+    return rows
 
-if teks_code and (not desc_en):
-    st.warning(f"No description found for **{teks_code}**. Paste the official TEKS description (EN) below for best results.")
-    desc_en = st.text_area("TEKS description (EN)", key="teks_desc_manual_en", placeholder="Paste the official TEKS statement…")
+@st.cache_data(show_spinner=False, ttl=24*3600)
+def _embedded_sample()->List[Dict[str,str]]:
+    return [
+        {"subject":"Math","grade":"2","code":"2.6A","strand":"Foundations of Multiplication",
+         "description_en":"Model and describe contextual multiplication situations.",
+         "description_es":"Modela y describe situaciones de multiplicación en contexto.","type":"Readiness"},
+        {"subject":"Reading","grade":"2","code":"2.6A","strand":"Comprehension",
+         "description_en":"Establish a purpose for reading and monitor comprehension.",
+         "description_es":"Establece un propósito para la lectura y monitorea la comprensión.","type":"Readiness"},
+    ]
 
-btn1, btn2, btn3, btn4 = st.columns([1,1,1,1])
-with btn1: gen_lesson_btn = st.button("Generate Lesson Plan", type="primary")
-with btn2: gen_worksheet_btn = st.button("Generate Worksheet", type="secondary")
-with btn3: gen_both_btn = st.button("Generate Both", type="secondary")
-with btn4: reset_btn = st.button("Reset")
-
-st.markdown("#### Teacher Notes & Attachments")
-teacher_notes = st.text_area("Teacher Notes", key="teacher_notes", height=180)
-attachments = st.file_uploader("Attach files/images (optional)", type=ATTACH_ALL_TYPES,
-                               accept_multiple_files=True, key="notes_attachments")
-def _extract_summary(uploaded):
-    return build_attachments_summary(uploaded or [])
-attach_summary, attach_preview = _extract_summary(attachments)
-if attachments:
-    cols = st.columns(min(4, len(attachments)))
-    for i, f in enumerate(attachments):
-        ext = f.name.split(".")[-1].lower() if "." in f.name else ""
-        with cols[i % len(cols)]:
-            if ext in ATTACH_IMAGE_TYPES: st.image(f, caption=f.name, use_container_width=True)
-            else: st.caption(attach_preview[i])
-teacher_notes_aug = (teacher_notes + ("\n\n" + attach_summary if attach_summary else "")).strip()
-
-if reset_btn:
-    for k in ["grade_widget","show_all_teks_widget","teks_select_widget","teks_manual_widget",
-              "teacher_notes","notes_attachments","teks_desc_manual_en",
-              "last_answer_key_pdf"]:
-        if k in st.session_state: del st.session_state[k]
-    last_zip = st.session_state.get("last_zip_path")
-    if last_zip:
-        try: Path(last_zip).unlink(missing_ok=True)
-        except Exception: pass
-        del st.session_state["last_zip_path"]
-    for k in ["last_lesson_pdf","last_worksheet_pdf"]: st.session_state.pop(k, None)
-    _safe_rerun()
-
-tabs = st.tabs(["Generate & Preview", "Bundle ZIP"])
-last_lesson_pdf = st.session_state.get("last_lesson_pdf")
-last_worksheet_pdf = st.session_state.get("last_worksheet_pdf")
-last_answer_key_pdf = st.session_state.get("last_answer_key_pdf")
-
-def _require_ai_ready():
-    if not OPENAI_KEY:
-        st.error("AI-only mode: set OPENAI_API_KEY.")
-        return False
-    if not HAS_LLMCLIENT:
-        st.error("AI-only mode: content_llm.LLMClient not found.")
-        return False
-    return True
-
-def _desc_for_prompt(en: str, es: str, bilingual: bool) -> str:
-    en = (en or "").strip(); es = (es or "").strip()
-    if bilingual and es: return f"EN: {en}\nES: {es}"
-    return en
-
-def _gen_and_show(doc_type: str):
-    if not _require_ai_ready(): return None
-    if not teks_code: st.error("Select or type a TEKS code."); return None
-    if not desc_en: st.error("Provide the TEKS description (EN) from the CSV or paste it."); return None
-    teks_desc = _desc_for_prompt(desc_en, desc_es, bilingual)
-
+@st.cache_data(show_spinner=False, ttl=24*3600)
+def load_teks_catalog()->Tuple[List[Dict[str,str]], str]:
+    try: secrets_url=st.secrets.get("TEKS_SOURCE_URL", None)  # type: ignore[attr-defined]
+    except Exception: secrets_url=None
+    url=(secrets_url or os.environ.get("TEKS_SOURCE_URL") or DEFAULT_TEKS_URL).strip()
     try:
-        if doc_type == "lesson":
-            st.info("Generating lesson plan (TEKS-aligned)…")
-            md = gen.generate_lesson_plan_ai(
-                grade_label=grade_label, teks_code=teks_code, teks_description=teks_desc,
-                bilingual=bilingual, teacher_notes=teacher_notes_aug, strict_align=strict_align
-            )
-        else:
-            st.info("Generating worksheet (TEKS-aligned)…")
-            result = gen.generate_worksheet_ai(
-                grade_label=grade_label, teks_code=teks_code, teks_description=teks_desc,
-                question_types=question_types, bilingual=bilingual, teacher_notes=teacher_notes_aug,
-                strict_align=strict_align
-            )
-    except Exception as e:
-        st.error(f"{doc_type.title()} generation failed: {e}")
-        return None
+        r=requests.get(url, timeout=12); r.raise_for_status()
+        rows=_read_csv_bytes(r.content)
+        if rows: return rows, "Remote (Google Sheet CSV)"
+    except Exception:
+        pass
+    return _embedded_sample(), "Embedded SAMPLE (fallback)"
 
-    if doc_type == "lesson":
-        out_name = f"Lesson_{grade_label.replace(' ','')}_{teks_code.replace('.','_')}_{_ts()}.pdf"
-        out_path = OUTPUT_DIR / out_name
-        try:
-            write_pdf_from_markdown(md, out_path)
-            st.session_state["last_lesson_pdf"] = str(out_path)
-            render_download_and_preview("Lesson Plan", out_path, "Preview: Lesson", expanded=True)
-            return out_path
-        except Exception as e:
-            st.error(f"Failed to build PDF: {e}")
-            return None
+def filter_teks(catalog:List[Dict[str,str]], grade_display:Optional[str], subject_display:Optional[str], query:str="")->List[Dict[str,str]]:
+    g="K" if (grade_display or "")=="Kinder" else _normalize_grade_in(grade_display or "")
+    s=_normalize_subject_in(subject_display or ""); q=(query or "").lower().strip()
+    out=[]
+    for row in catalog:
+        if g and row["grade"]!=g: continue
+        if s and row["subject"]!=s: continue
+        if q:
+            hay=" ".join([row["code"],row.get("strand",""),row.get("description_en",""),row.get("description_es","")]).lower()
+            if q not in hay: continue
+        out.append(row)
+    out.sort(key=lambda r:(r["grade"],r["subject"],r["code"]))
+    return out
+
+# -----------------------------------------------------------------------------
+# Layout (Announcements a bit wider)
+# -----------------------------------------------------------------------------
+left, right = st.columns([0.36, 2.64], vertical_alignment="top")
+
+with left:
+    st.markdown("### 📣 Announcements")
+    st.markdown(
+        """
+        <div class="ann-card">
+          <div class="ann-title">🤖 AI Agent coming soon <span class="badge">Preview</span></div>
+          <div class="ann-sub">Autonomous lesson refinement, TEKS validation, and worksheet QA—powered by your catalog + Teacher Notes.</div>
+        </div>
+        <div class="ann-card">
+          <div class="ann-title">🚀 Are you ready for the challenge?</div>
+          <div class="ann-sub">Join our 1-month pilot to stress-test real classroom flows and polish v1.0.</div>
+          <hr class="soft"/>
+          <div class="small-note">Tip: toggle <b>Bilingual Output</b> and try Reading <code>2.6A</code> to preview EN/ES generation.</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+with right:
+    st.markdown("### Grade & TEKS")
+    col_g, col_s = st.columns([1,1], vertical_alignment="center")
+    with col_g:
+        grade_choice = st.selectbox("Grade", GRADE_OPTIONS, index=None, placeholder="Select a grade...", key="grade_choice")
+    with col_s:
+        subject_choice = st.selectbox("Subject", SUBJECT_OPTIONS, index=None, placeholder="Select a subject...", key="subject_choice")
+
+    catalog, source_label = load_teks_catalog()
+    disabled = not (grade_choice and subject_choice)
+
+    filter_text = st.text_input("Filter TEKS by code, strand, or keyword (EN/ES)", value="", disabled=disabled,
+                                placeholder="e.g., 2.6A, multiplication, 'inferences', 'multiplicación'...", key="teks_filter_text")
+
+    options=[]; label_map={}
+    if not disabled:
+        for row in filter_teks(catalog, grade_choice, subject_choice, filter_text):
+            strand=(row.get("strand") or "").strip()
+            snippet=(row.get("description_en") or row.get("description_es") or "")[:70]
+            label=f"{row['code']} — {strand if strand else snippet}"
+            label_map[label]=row; options.append(label)
+
+    teks_label = st.selectbox("TEKS (auto-populated by grade & subject)", options=options, index=None,
+                              disabled=disabled or not options, placeholder="Pick a TEKS code...", key="teks_dropdown")
+
+    manual_code = st.text_input("Or enter TEKS code manually", value="", placeholder="e.g., 2.6A",
+                                help="Manual entry overrides the dropdown if filled.", key="manual_teks_code")
+
+    selected_meta = label_map.get(teks_label) if teks_label else None
+    if manual_code.strip():
+        teks_code = manual_code.strip()
+        if selected_meta and selected_meta["code"].lower()!=teks_code.lower(): selected_meta=None
     else:
-        # Worksheet: separate Answer Key
-        if isinstance(result, dict):
-            ws_md = result.get("worksheet_md","")
-            key_md = result.get("answer_key_md","")
-        else:
-            ws_md = str(result); key_md = ""
+        teks_code = selected_meta["code"] if selected_meta else None
 
-        ws_name = f"Worksheet_{grade_label.replace(' ','')}_{teks_code.replace('.','_')}_{_ts()}.pdf"
-        ws_path = OUTPUT_DIR / ws_name
+    if selected_meta:
+        en=selected_meta.get("description_en",""); es=selected_meta.get("description_es","")
+        strand=selected_meta.get("strand",""); typ=selected_meta.get("type","")
+        st.markdown(
+            f"""
+            <div class="teks-summary">
+              <div class="label">{selected_meta['code']}</div>
+              <div class="meta">{strand}{' · ' + typ if typ else ''}</div>
+              {"<div style='margin-top:8px'><b>English:</b><br/>"+en+"</div>" if en else ""}
+              {"<div style='margin-top:8px'><b>Español:</b><br/>"+es+"</div>" if es else ""}
+            </div>""",
+            unsafe_allow_html=True,
+        )
+
+    # Health + Reload + AI status
+    ai_on = bool(os.getenv("OPENAI_API_KEY")); model = os.getenv("OPENAI_MODEL","gpt-4o-mini")
+    st.caption(f"TEKS source: {source_label} — {len(catalog)} rows · AI: {'ON ✅' if ai_on else 'OFF ⛔️'} · Model: {model}")
+    rc1, _ = st.columns([1,6])
+    with rc1:
+        if st.button("Reload TEKS catalog", help="Clear cache and re-fetch from the source URL."):
+            load_teks_catalog.clear(); st.success("TEKS reloaded from source."); st.rerun()
+
+    # Controls
+    c1,c2,c3 = st.columns([1,1,1])
+    with c1:
+        bilingual = st.toggle("Bilingual Output (EN+ES)", value=True, help="Generate materials in both English and Spanish.", key="bilingual_toggle")
+    with c2:
+        generate = st.button("Generate Lesson Plan & Worksheets", type="primary", use_container_width=True, key="btn_generate")
+    with c3:
+        if st.button("Reset Form", use_container_width=True, key="btn_reset"):
+            for k in ["grade_choice","subject_choice","teks_filter_text","teks_dropdown","manual_teks_code","bilingual_toggle","teacher_notes","uploaded_notes"]:
+                if k in st.session_state: del st.session_state[k]
+            st.rerun()
+
+    # ─────────────────── Teacher Notes + File Upload ────────────────────
+    teacher_notes = st.text_area(
+        "Teacher Notes (optional)", height=120,
+        placeholder="Scaffolds, language supports, manipulatives, accommodations, student interests, etc.",
+        key="teacher_notes",
+    )
+    uploaded = st.file_uploader(
+        "Attach reference files (optional): PDF, DOCX, TXT, PNG, JPG",
+        type=["pdf","docx","txt","png","jpg","jpeg"],
+        accept_multiple_files=True,
+        help="Attached content will be summarized into the AI prompt.",
+        key="uploaded_notes",
+    )
+
+    # Strong extractor (PyMuPDF + OCR fallback). Returns combined text and per-file details.
+    def _extract_text_from_uploads(files) -> Tuple[str, List[Tuple[str,int,str]]]:
+        if not files: return "", []
+        combined = []
+        details: List[Tuple[str,int,str]] = []
+        PER_FILE_CAP = 8000
+        OVERALL_CAP = 20000
+
+        for f in files:
+            name = f.name
+            lname = name.lower()
+            note = ""
+            text = ""
+
+            try:
+                if lname.endswith(".pdf"):
+                    try:
+                        import fitz  # PyMuPDF
+                        b = f.read()
+                        doc = fitz.open(stream=b, filetype="pdf")
+                        chunks = []
+                        for page in doc:
+                            t = page.get_text("text") or ""
+                            if not t.strip():
+                                # OCR fallback for scanned page
+                                try:
+                                    import pytesseract
+                                    from PIL import Image
+                                    pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+                                    img = Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
+                                    t = pytesseract.image_to_string(img)
+                                    if not note: note = "OCR used"
+                                except Exception:
+                                    pass
+                            if t: chunks.append(t)
+                        text = "\n".join(chunks)
+                        if not text.strip():
+                            note = note or "no text found"
+                    except Exception:
+                        note = "PyMuPDF failed"; text = ""
+
+                elif lname.endswith(".docx"):
+                    try:
+                        import docx
+                        d = docx.Document(f)
+                        text = "\n".join(p.text for p in d.paragraphs)
+                    except Exception:
+                        note = "docx read failed"; text = ""
+
+                elif lname.endswith(".txt"):
+                    try:
+                        text = f.read().decode("utf-8", "ignore")
+                    except Exception:
+                        note = "txt decode failed"; text = ""
+
+                elif lname.endswith((".png",".jpg",".jpeg")):
+                    try:
+                        import pytesseract
+                        from PIL import Image
+                        f.seek(0)
+                        img = Image.open(f).convert("RGB")
+                        text = pytesseract.image_to_string(img)
+                        if not text.strip(): note = "image OCR produced no text"
+                    except Exception:
+                        note = "image OCR failed"; text = ""
+
+                text = (text or "")[:PER_FILE_CAP]
+
+            except Exception:
+                note = note or "read error"; text = ""
+
+            details.append((name, len(text), note))
+            if text:
+                combined.append(f"[FILE: {name}]{' ('+note+')' if note else ''}\n{text}\n")
+
+            if sum(len(x) for x in combined) >= OVERALL_CAP:
+                break
+
+        return "\n\n".join(combined)[:OVERALL_CAP], details
+
+    uploads_text, upload_details = _extract_text_from_uploads(uploaded)
+    if uploads_text:
+        st.caption(f"Attached notes processed ({len(uploads_text)} chars).")
+        with st.expander("Preview what was read from your uploads"):
+            for fname, nchar, note in upload_details:
+                st.write(f"**{fname}** — {nchar} chars" + (f" · _{note}_" if note else ""))
+            st.code(uploads_text[:1200] + ("… (truncated)" if len(uploads_text) > 1200 else ""))
+    else:
+        if uploaded:
+            st.warning("Could not extract any text from the uploaded files. If they are scans, OCR may be needed.")
+
+    # ───────────────────── Generator call wrapper ────────────────────────
+    def _safe_call_generator(teks_code, grade_choice, subject_choice, bilingual, teacher_notes, attachments_text, meta):
+        import inspect
         try:
-            write_pdf_from_markdown(ws_md, ws_path)
-            st.session_state["last_worksheet_pdf"] = str(ws_path)
-            render_download_and_preview("Worksheet", ws_path, "Preview: Worksheet", expanded=True)
+            from generator import generate_all_outputs
         except Exception as e:
-            st.error(f"Failed to build Worksheet PDF: {e}")
-            return None
+            st.error("Could not import generator.generate_all_outputs"); st.exception(e); return None
+        norm_grade="K" if grade_choice=="Kinder" else grade_choice
+        desired = {
+            "teks_code":teks_code,"grade":norm_grade,"subject":subject_choice,
+            "bilingual":bilingual,
+            "teacher_notes": (teacher_notes or ""),
+            "attachments_text": (attachments_text or ""),
+            "teks_description_en": meta.get("description_en") if meta else None,
+            "teks_description_es": meta.get("description_es") if meta else None,
+            "teks_strand": meta.get("strand") if meta else None,
+            "teks_type":  meta.get("type") if meta else None,
+        }
+        sig=inspect.signature(generate_all_outputs)
+        kwargs={k:v for k,v in desired.items() if k in sig.parameters and v is not None}
+        try: return generate_all_outputs(**kwargs)
+        except Exception as e:
+            st.error("The generator raised an exception."); st.exception(e); return None
 
-        if key_md.strip():
-            key_name = f"AnswerKey_{grade_label.replace(' ','')}_{teks_code.replace('.','_')}_{_ts()}.pdf"
-            key_path = OUTPUT_DIR / key_name
-            try:
-                write_pdf_from_markdown(key_md, key_path, title_override=f"Answer Key — Math {grade_label} — {teks_code}")
-                st.session_state["last_answer_key_pdf"] = str(key_path)
-                with open(key_path, "rb") as f:
-                    st.download_button("Download Answer Key PDF", f, file_name=key_name, mime="application/pdf")
-            except Exception as e:
-                st.warning(f"Could not build Answer Key PDF: {e}")
-        else:
-            st.info("No separate Answer Key was produced for this worksheet type.")
-        return ws_path
+# ───────────────── PDF preview (slider / show-all) ───────────────────────────
+def _preview_pdf(path: str, label: str):
+    import os, base64
+    colA, colB = st.columns([4, 1])
 
-with tabs[0]:
-    if gen_lesson_btn: _gen_and_show("lesson")
-    if gen_worksheet_btn: _gen_and_show("worksheet")
-    if gen_both_btn:
-        lp = _gen_and_show("lesson"); wp = _gen_and_show("worksheet")
-        if lp and wp: st.success("Generated both.")
+    try:
+        import fitz  # PyMuPDF
+        doc = fitz.open(path)
+        num_pages = len(doc)
 
-with tabs[1]:
-    st.markdown("### Bundle ZIP")
-    lp = Path(last_lesson_pdf) if last_lesson_pdf else None
-    wp = Path(last_worksheet_pdf) if last_worksheet_pdf else None
-    ak = Path(last_answer_key_pdf) if last_answer_key_pdf else None
-    st.text(f"Lesson: {lp.name if lp else '(none)'}")
-    st.text(f"Worksheet: {wp.name if wp else '(none)'}")
-    st.text(f"Answer Key: {ak.name if ak else '(none)'}")
-    if st.button("Create ZIP"):
-        if not any([lp and lp.exists(), wp and wp.exists(), ak and ak.exists()]):
-            st.error("Generate at least one PDF first.")
-        else:
-            zip_path = OUTPUT_DIR / f"Bundle_{grade_label.replace(' ','')}_{teks_code.replace('.','_')}_{_ts()}.zip"
-            try:
-                zip_bundle([p for p in [lp, wp, ak] if p], zip_path)
-                st.session_state["last_zip_path"] = str(zip_path)
-                st.success(f"ZIP ready → {zip_path.name}")
-                with open(zip_path, "rb") as f:
-                    st.download_button("Download ZIP", f, file_name=zip_path.name, mime="application/zip")
-            except Exception as e:
-                st.error(f"Failed to create ZIP: {e}")
+        with colA:
+            st.caption(f"{label} • {num_pages} page(s)")
+            show_all = st.toggle(
+                "Show all pages", value=False,
+                help="Render every page below (can be slower for long PDFs).",
+                key=f"showall_{label}"
+            )
+            if not show_all:
+                page_index = st.slider("Page", 1, num_pages, 1, key=f"slider_{label}")
+                page = doc.load_page(page_index - 1)
+                pix = page.get_pixmap(matrix=fitz.Matrix(2.5, 2.5))  # crisp preview
+                st.image(pix.tobytes("png"), use_container_width=True,
+                         caption=f"{label} — Page {page_index}")
+            else:
+                for i in range(num_pages):
+                    page = doc.load_page(i)
+                    pix = page.get_pixmap(matrix=fitz.Matrix(2.2, 2.2))
+                    st.image(pix.tobytes("png"), use_container_width=True,
+                             caption=f"{label} — Page {i+1}")
+
+        with colB:
+            st.download_button(
+                f"Download {label}", open(path, "rb"),
+                file_name=os.path.basename(path),
+                mime="application/pdf", use_container_width=True
+            )
+
+    except Exception:
+        with open(path, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode("ascii")
+        with colA:
+            st.markdown(
+                f"PDF inline preview unavailable. "
+                f"[Open in a new tab](data:application/pdf;base64,{b64})."
+            )
+        with colB:
+            st.download_button(
+                f"Download {label}", open(path, "rb"),
+                file_name=os.path.basename(path),
+                mime="application/pdf", use_container_width=True
+            )
+
+# ───────────────── Robust generate handler ───────────────────────────────────
+if generate:
+    st.toast("Starting generation…", icon="⏳")
+
+    try:
+        if not (grade_choice and subject_choice):
+            st.error("Select a **Grade** and **Subject** first.")
+            st.stop()
+
+        _code = None
+        if selected_meta:
+            _code = selected_meta.get("code")
+        if manual_code.strip():
+            _code = manual_code.strip()  # manual overrides
+
+        if not _code:
+            st.error("Pick a TEKS in the dropdown **or** type one manually (e.g., `3.2D`).")
+            st.stop()
+
+        with st.spinner(f"Generating materials for TEKS {_code}…"):
+            outputs = _safe_call_generator(
+                _code, grade_choice or "", subject_choice or "",
+                bilingual, teacher_notes, uploads_text, selected_meta
+            )
+
+        if not outputs:
+            st.error("Generation failed. See the error above (if any).")
+            st.stop()
+
+        st.success("Done! Your files are ready below.")
+        if is_dataclass(outputs):
+            outputs = asdict(outputs)
+
+        # Downloads row
+        cdl1, cdl2, cdl3, cdl4 = st.columns(4)
+        with cdl1:
+            st.download_button(
+                "Lesson Plan PDF", open(outputs["lesson_plan_fp"], "rb"),
+                file_name=os.path.basename(outputs["lesson_plan_fp"]),
+                mime="application/pdf", use_container_width=True
+            )
+        with cdl2:
+            st.download_button(
+                "Worksheet PDF", open(outputs["worksheet_fp"], "rb"),
+                file_name=os.path.basename(outputs["worksheet_fp"]),
+                mime="application/pdf", use_container_width=True
+            )
+        with cdl3:
+            st.download_button(
+                "Answer Key PDF", open(outputs["answer_key_fp"], "rb"),
+                file_name=os.path.basename(outputs["answer_key_fp"]),
+                mime="application/pdf", use_container_width=True
+            )
+        with cdl4:
+            st.download_button(
+                "All as ZIP", open(outputs["zip_fp"], "rb"),
+                file_name=os.path.basename(outputs["zip_fp"]),
+                mime="application/zip", use_container_width=True
+            )
+
+        # Previews (image-based)
+        tabs = st.tabs(["Preview: Lesson Plan", "Preview: Worksheet", "Preview: Answer Key"])
+        with tabs[0]:
+            _preview_pdf(outputs["lesson_plan_fp"], "Lesson Plan")
+        with tabs[1]:
+            _preview_pdf(outputs["worksheet_fp"], "Worksheet")
+        with tabs[2]:
+            _preview_pdf(outputs["answer_key_fp"], "Answer Key")
+
+        st.toast("Generation complete ✅")
+
+    except Exception as e:
+        st.error("Unexpected error during generation.")
+        st.exception(e)
